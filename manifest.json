@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.kamil.msi-fan-rgb",
+  "name": "MSI Fan & RGB",
+  "version": "0.1.0",
+  "author": "kamil",
+  "license": "MIT",
+  "description": "Fan curves and Mystic Light RGB control for MSI motherboards in the Omarchy bar: temperatures, pump and system fan RPM, named fan profiles, per-fan manual speed and RGB presets.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "MSI Fan & RGB",
+    "description": "Shows CPU temperature and fan speed. Click for fan profiles, per-fan manual control and Mystic Light RGB presets.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "intervalSec": 5,
+      "display": "CPU temp",
+      "showRgb": true,
+      "showUnusedFans": false,
+      "rgbDevice": ""
+    },
+    "schema": [
+      {
+        "key": "intervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "How often the widget asks msi-fanctl for temperatures and fan speeds. A status read is a handful of sysfs files, so 2-5 seconds is cheap."
+      },
+      {
+        "key": "display",
+        "type": "enum",
+        "label": "Bar label",
+        "options": ["CPU temp", "Fan RPM", "Both", "Icon"],
+        "defaultValue": "CPU temp",
+        "description": "What to print beside the fan icon. Fan RPM shows the fastest spinning header at the moment."
+      },
+      {
+        "key": "showRgb",
+        "type": "boolean",
+        "label": "Show RGB controls",
+        "defaultValue": true,
+        "description": "Add the Mystic Light section to the popup. Turn it off if you manage lighting elsewhere."
+      },
+      {
+        "key": "showUnusedFans",
+        "type": "boolean",
+        "label": "Show empty fan headers",
+        "defaultValue": false,
+        "description": "Show every header the Super I/O exposes, including ones with no fan attached. Otherwise only headers reporting RPM (and the CPU fan) are listed."
+      },
+      {
+        "key": "rgbDevice",
+        "type": "string",
+        "label": "OpenRGB device filter",
+        "defaultValue": "",
+        "description": "Substring of the OpenRGB device name to control, for example 'MSI'. Empty means the first MSI device OpenRGB finds, which is the motherboard on a single-controller system."
+      }
+    ]
+  }
+}

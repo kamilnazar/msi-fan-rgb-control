@@ -1,0 +1,23 @@
+[Unit]
+Description=MSI fan curve daemon (NCT6687 Super I/O)
+Documentation=file:///usr/local/lib/msi-fan-rgb/README.md
+After=local-fs.target
+# The hwmon device appears when nct6687 loads; modules-load.d handles that.
+ConditionPathExists=/sys/class/hwmon
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/msi-fan-rgb/msi-fan-rgbd
+# If the daemon crashes or is stopped, hand every NCT6687 fan back to the
+# firmware. This is the last line of defence against a fan stuck at 0%.
+ExecStopPost=/bin/sh -c 'for d in /sys/class/hwmon/hwmon*; do [ "$(cat "$d/name" 2>/dev/null)" = nct6687 ] || continue; for p in "$d"/pwm*_enable; do [ -w "$p" ] && echo 2 > "$p" || true; done; done'
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=msi-fan-rgb
+RuntimeDirectoryMode=0775
+StateDirectory=msi-fan-rgb
+StateDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

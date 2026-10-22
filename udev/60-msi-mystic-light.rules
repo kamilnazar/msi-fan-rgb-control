@@ -1,0 +1,4 @@
+# Mystic Light fallback rule. OpenRGB ships a broader copy of this rule
+# (60-openrgb.rules); install.sh only adds this one when OpenRGB's rule is
+# missing, so the hidraw node gets an ACL for the logged-in user either way.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0db0", ATTRS{idProduct}=="0076", TAG+="uaccess", MODE="0660"

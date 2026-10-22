@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""msi-rgb -- RGB control for the MSI Mystic Light motherboard controller.
+
+Wraps the OpenRGB command line.  OpenRGB already speaks the Mystic Light
+protocol, owns the udev rules and handles modes and per-zone colors, so this
+script only has to turn argv into a sane ``openrgb`` invocation and remember
+what was applied.
+
+OpenRGB cannot report the current mode, color or brightness back, so the last
+successful write is cached in ``$XDG_CACHE_HOME/msi-fan-rgb/rgb-state.json``.
+That cache is what the widget shows, and what ``preset on`` restores after
+``preset off``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "msi-fan-rgb")
+CACHE_FILE = os.environ.get("MSI_FAN_RGB_CACHE",
+                            os.path.join(CACHE_DIR, "rgb-state.json"))
+OPENRGB = os.environ.get("OPENRGB", "openrgb")
+
+# Modes the widget offers. The value is a fragment used to find the matching
+# OpenRGB mode name; the label is what the popup shows.
+PRESETS = {
+    "static": ("static", "Static"),
+    "breathing": ("breathing", "Breathing"),
+    "rainbow": ("rainbow wave", "Rainbow"),
+    "wave": ("color wave", "Wave"),
+    "meteor": ("meteor", "Meteor"),
+    "lightning": ("lightning", "Lightning"),
+    "off": (None, "Off"),
+}
+
+
+def read_cache():
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_cache(data):
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        temporary = CACHE_FILE + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary, CACHE_FILE)
+    except OSError:
+        pass
+
+
+def find_binary():
+    if os.path.sep in OPENRGB:
+        return OPENRGB if os.path.exists(OPENRGB) else None
+    return shutil.which(OPENRGB)
+
+
+def run_openrgb(args, timeout=15):
+    binary = find_binary()
+    if not binary:
+        raise RuntimeError("openrgb is not installed")
+    completed = subprocess.run(
+        [binary, "--noautoconnect"] + args,
+        capture_output=True, text=True, timeout=timeout)
+    if completed.returncode != 0:
+        message = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(message or f"openrgb exited {completed.returncode}")
+    return completed.stdout
+
+
+def split_names(text):
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+    names = []
+    for token in tokens:
+        token = token.strip().strip("[]")
+        token = token.strip("'\"")
+        if token:
+            names.append(token)
+    return names
+
+
+def parse_devices(text):
+    devices = []
+    current = None
+    for line in text.splitlines():
+        header = re.match(r"^\s*(\d+):\s+(.*)$", line)
+        if header:
+            current = {
+                "index": int(header.group(1)),
+                "name": header.group(2).strip(),
+                "type": "",
+                "description": "",
+                "location": "",
+                "modes": [],
+                "zones": [],
+            }
+            devices.append(current)
+            continue
+        if current is None:
+            continue
+        field = re.match(r"^\s+(Type|Description|Location|Serial|Version|"
+                         r"Modes|Zones|LEDs):\s*(.*)$", line)
+        if not field:
+            continue
+        key = field.group(1).lower()
+        value = field.group(2).strip()
+        if key == "modes":
+            current["modes"] = split_names(value)
+        elif key == "zones":
+            current["zones"] = split_names(value)
+        else:
+            current[key] = value
+    return devices
+
+
+def detect(device_filter=None, verbose=False):
+    binary = find_binary()
+    if not binary:
+        return {"available": False, "error": "openrgb is not installed",
+                "device": None, "devices": [], "zones": [], "modes": []}
+    try:
+        output = run_openrgb(["-ld"])
+    except (RuntimeError, subprocess.TimeoutExpired) as error:
+        return {"available": False, "error": str(error), "device": None,
+                "devices": [], "zones": [], "modes": []}
+    devices = parse_devices(output)
+    wanted = (device_filter or "MSI").lower()
+    device = None
+    for candidate in devices:
+        haystack = " ".join([candidate["name"], candidate["description"],
+                             candidate["location"]]).lower()
+        if wanted in haystack:
+            device = candidate
+            break
+    if device is None and devices:
+        device = devices[0]
+    return {
+        "available": True,
+        "error": None,
+        "device": device["name"] if device else None,
+        "index": device["index"] if device else None,
+        "zones": device["zones"] if device else [],
+        "modes": device["modes"] if device else [],
+        "devices": [item["name"] for item in devices],
+    }
+
+
+def normalize_color(value):
+    if value is None:
+        return None
+    color = value.strip().lstrip("#").upper()
+    if color in ("RANDOM",):
+        return "random"
+    if not re.fullmatch(r"[0-9A-F]{6}", color):
+        raise SystemExit(f"bad color {value!r}; use RRGGBB or #RRGGBB")
+    return color
+
+
+def resolve_mode(device, wanted):
+    if not wanted:
+        return None
+    wanted = wanted.strip().lower().strip("[]")
+    for mode in device.get("modes", []):
+        normalized = mode.strip().lower().replace("'", "")
+        normalized = re.sub(r"^\[|\]$", "", normalized).strip()
+        if normalized == wanted:
+            return re.sub(r"^\[|\]$", "", mode).strip()
+    for mode in device.get("modes", []):
+        normalized = mode.strip().lower().replace("'", "").strip("[]")
+        if wanted in normalized:
+            return re.sub(r"^\[|\]$", "", mode).strip()
+    return None
+
+
+def status(args):
+    cache = read_cache()
+    detected = detect(args.device)
+    if not detected["available"]:
+        return {
+            "ok": False,
+            "available": False,
+            "error": detected["error"],
+            "preset": cache.get("preset"),
+            "mode": cache.get("mode"),
+            "brightness": cache.get("brightness"),
+            "color": cache.get("color"),
+            "off": cache.get("off", False),
+            "zones": [],
+            "modes": [],
+            "device": None,
+        }
+    return {
+        "ok": True,
+        "available": True,
+        "error": None,
+        "device": detected["device"],
+        "devices": detected["devices"],
+        "zones": detected["zones"],
+        "modes": detected["modes"],
+        "preset": cache.get("preset"),
+        "mode": cache.get("mode"),
+        "brightness": cache.get("brightness", 100),
+        "color": cache.get("color"),
+        "off": cache.get("off", False),
+        "updated": cache.get("updated"),
+    }
+
+
+def apply(args):
+    cache = read_cache()
+    detected = detect(args.device)
+    if not detected["available"]:
+        return {"ok": False, "error": detected["error"]}
+
+    preset = args.preset
+    color = normalize_color(args.color) if args.color else cache.get("color")
+    brightness = args.brightness
+    if brightness is None:
+        brightness = cache.get("brightness", 100)
+    brightness = max(0, min(100, int(brightness)))
+
+    mode = args.mode
+    off = False
+    write_brightness = brightness
+    if preset:
+        if preset not in PRESETS:
+            return {"ok": False, "error": f"unknown preset: {preset}"}
+        if preset == "on":
+            mode = cache.get("mode") or "Static"
+            color = color or cache.get("color")
+            brightness = cache.get("brightness", 100)
+            write_brightness = brightness
+        else:
+            fragment, _label = PRESETS[preset]
+            if preset == "off":
+                # Keep the last brightness in the cache so the next preset can
+                # restore the lighting instead of re-applying a black frame.
+                off = True
+                write_brightness = 0
+                mode = cache.get("mode")
+            else:
+                resolved = resolve_mode(detected, fragment)
+                if resolved is None:
+                    return {"ok": False,
+                            "error": f"this device does not offer the "
+                                     f"{preset!r} mode"}
+                mode = resolved
+
+    if not mode and not color and args.brightness is None and not off:
+        return {"ok": False, "error": "nothing to apply"}
+
+    argv = ["-d", detected["device"]]
+    if args.zone is not None and args.zone != "all":
+        zone_index = args.zone
+        if not str(zone_index).isdigit():
+            names = [zone.lower() for zone in detected["zones"]]
+            try:
+                zone_index = names.index(str(zone_index).lower())
+            except ValueError:
+                return {"ok": False,
+                        "error": f"unknown zone {args.zone!r}; "
+                                 f"zones are {', '.join(detected['zones'])}"}
+        argv += ["-z", str(zone_index)]
+    if mode:
+        argv += ["-m", mode]
+    if color:
+        argv += ["-c", color]
+    argv += ["-b", str(write_brightness)]
+
+    try:
+        run_openrgb(argv)
+    except (RuntimeError, subprocess.TimeoutExpired) as error:
+        return {"ok": False, "error": str(error)}
+
+    cache.update({
+        "device": detected["device"],
+        "mode": mode or cache.get("mode"),
+        "color": color or cache.get("color"),
+        "brightness": brightness,
+        "preset": preset or cache.get("preset"),
+        "off": off,
+    })
+    cache["updated"] = int(__import__("time").time())
+    write_cache(cache)
+    return {
+        "ok": True,
+        "device": detected["device"],
+        "mode": cache.get("mode"),
+        "color": cache.get("color"),
+        "brightness": cache.get("brightness"),
+        "preset": cache.get("preset"),
+        "off": cache.get("off", False),
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="MSI Mystic Light RGB control")
+    parser.add_argument("--device", default=os.environ.get("MSI_RGB_DEVICE", ""),
+                        help="substring of the OpenRGB device name (default: MSI)")
+    sub = parser.add_subparsers(dest="command")
+
+    status_parser = sub.add_parser("status", help="print device and cached state")
+
+    set_parser = sub.add_parser("set", help="apply mode, color and brightness")
+    set_parser.add_argument("--mode", help="OpenRGB mode name, e.g. Static")
+    set_parser.add_argument("--color", help="RRGGBB or #RRGGBB")
+    set_parser.add_argument("--brightness", type=int, help="0-100")
+    set_parser.add_argument("--zone", help="zone index, name, or 'all'")
+
+    preset_parser = sub.add_parser("preset", help="apply one of the named presets")
+    preset_parser.add_argument("preset", choices=sorted(PRESETS))
+    preset_parser.add_argument("--color", help="RRGGBB or #RRGGBB")
+    preset_parser.add_argument("--brightness", type=int, help="0-100")
+    preset_parser.add_argument("--zone", help="zone index, name, or 'all'")
+
+    args = parser.parse_args(argv)
+    args.device = args.device or None
+    command = args.command or "status"
+    if command == "status":
+        result = status(args)
+    else:
+        if not hasattr(args, "preset"):
+            args.preset = None
+        if not hasattr(args, "mode"):
+            args.mode = None
+        if not hasattr(args, "color"):
+            args.color = None
+        if not hasattr(args, "brightness"):
+            args.brightness = None
+        if not hasattr(args, "zone"):
+            args.zone = None
+        result = apply(args)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,5 @@
+# Runtime and build leftovers
+__pycache__/
+*.pyc
+*.pkg.tar.zst
+.pytest_cache/

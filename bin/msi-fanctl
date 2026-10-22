@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""msi-fanctl -- read MSI fan state and talk to msi-fan-rgbd.
+
+Reads (``status``) work without the daemon: sysfs is world-readable, so the
+bar keeps showing temperatures and RPM even if the service is down. Writes
+(``profile``, ``mode``, ``manual``, ``curve``, ...) are sent to the daemon
+over its Unix socket, which is the only process allowed to touch PWM.
+
+The output is one JSON document on stdout. The Omarchy widget parses it, and
+``--pretty`` makes it pleasant in a terminal.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+
+SOCKET_PATH = os.environ.get("MSI_FAN_RGB_SOCKET", "/run/msi-fan-rgb/control.sock")
+SYSFS = os.environ.get("MSI_FAN_RGB_SYSFS", "/sys/class/hwmon")
+
+TEMP_LABELS = {
+    "cpu": "cpu",
+    "system": "system",
+    "vrm mos": "vrm",
+    "vrm": "vrm",
+    "pch": "chipset",
+    "chipset": "chipset",
+    "cpu socket": "socket",
+    "pcie x1": "pcie",
+    "m2_1": "m2",
+}
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def read_int(path):
+    try:
+        return int(read_text(path))
+    except (TypeError, ValueError):
+        return None
+
+
+def find_hwmon():
+    try:
+        entries = sorted(os.listdir(SYSFS))
+    except OSError:
+        return None
+    for entry in entries:
+        path = os.path.join(SYSFS, entry)
+        if read_text(os.path.join(path, "name")) in ("nct6687", "nct6683"):
+            return path
+    return None
+
+
+def read_temps(root):
+    temps = {}
+    for channel in range(1, 8):
+        label = read_text(os.path.join(root, f"temp{channel}_label"))
+        value = read_int(os.path.join(root, f"temp{channel}_input"))
+        key = TEMP_LABELS.get(label.lower())
+        if key and value and value > 0:
+            temps[key] = round(value / 1000.0, 1)
+    # k10temp's Tctl is the number people compare against Ryzen Master.
+    try:
+        entries = sorted(os.listdir(SYSFS))
+    except OSError:
+        entries = []
+    for entry in entries:
+        path = os.path.join(SYSFS, entry)
+        if read_text(os.path.join(path, "name")) != "k10temp":
+            continue
+        for channel in range(1, 4):
+            label = read_text(os.path.join(path, f"temp{channel}_label"))
+            if label in ("Tctl", "Tdie"):
+                value = read_int(os.path.join(path, f"temp{channel}_input"))
+                if value:
+                    temps["tctl"] = round(value / 1000.0, 1)
+                    break
+    return temps
+
+
+def local_status():
+    """Fallback status straight from sysfs, used when the daemon is down."""
+    root = find_hwmon()
+    if not root:
+        return {
+            "ok": False,
+            "daemon": False,
+            "error": "no NCT6687 sensor; load the nct6687 module",
+            "fans": [],
+            "temps": {},
+            "choices": [],
+        }
+    temps = read_temps(root)
+    fans = []
+    for channel in range(1, 9):
+        pwm_path = os.path.join(root, f"pwm{channel}")
+        rpm_path = os.path.join(root, f"fan{channel}_input")
+        if not (os.path.exists(pwm_path) or os.path.exists(rpm_path)):
+            continue
+        raw = read_int(pwm_path) or 0
+        enable = read_int(os.path.join(root, f"pwm{channel}_enable"))
+        fans.append({
+            "channel": channel,
+            "label": read_text(os.path.join(root, f"fan{channel}_label"))
+                     or f"Fan {channel}",
+            "group": None,
+            "rpm": read_int(rpm_path) or 0,
+            "pwm": raw,
+            "percent": round(raw * 100 / 255),
+            "enable": enable,
+            "controlled": enable == 1,
+            "curve": None,
+        })
+    return {
+        "ok": True,
+        "daemon": False,
+        "driver": read_text(os.path.join(root, "name")),
+        "hwmon": root,
+        "mode": "auto",
+        "profile": None,
+        "profileLabel": "Firmware" if any(
+            fan.get("enable") == 2 for fan in fans) else "Unknown",
+        "choices": [{"id": "auto", "label": "Auto"}],
+        "curveSource": None,
+        "sources": [key for key in ("cpu", "tctl", "system", "vrm",
+                                    "chipset", "socket") if key in temps],
+        "temps": temps,
+        "cpuTemp": temps.get("cpu", temps.get("tctl", 0)),
+        "fans": fans,
+        "thermal": False,
+        "warnings": ["msi-fan-rgbd is not running; fan control is read-only"],
+        "updated": 0,
+    }
+
+
+def request(payload, timeout=3.0):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(SOCKET_PATH)
+        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        chunks = []
+        while True:
+            data = sock.recv(65536)
+            if not data:
+                break
+            chunks.append(data)
+            if b"\n" in data:
+                break
+        raw = b"".join(chunks).decode("utf-8").strip()
+        if not raw:
+            raise RuntimeError("the daemon closed the connection without an answer")
+        return json.loads(raw)
+    finally:
+        sock.close()
+
+
+def parse_points(text):
+    points = []
+    for part in text.replace(" ", "").split(";"):
+        if not part:
+            continue
+        pieces = part.split(",")
+        if len(pieces) != 2:
+            raise SystemExit(f"bad curve point {part!r}; use temp,percent")
+        points.append([float(pieces[0]), float(pieces[1])])
+    return points
+
+
+def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    pretty = "--pretty" in raw_argv
+    raw_argv = [item for item in raw_argv if item != "--pretty"]
+
+    parser = argparse.ArgumentParser(description="MSI fan control client")
+    parser.add_argument("--socket", default=SOCKET_PATH,
+                        help="daemon socket (default: %(default)s)")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("status", help="print fan, temperature and profile state")
+    sub.add_parser("save", help="persist the current mode and profile")
+    sub.add_parser("reload", help="re-read /etc/msi-fan-rgb/config.json")
+
+    mode = sub.add_parser("mode", help="auto, curve or manual")
+    mode.add_argument("mode", choices=("auto", "curve", "manual"))
+
+    profile = sub.add_parser("profile", help="apply a named fan profile")
+    profile.add_argument("profile")
+
+    manual = sub.add_parser("manual", help="hold one fan at a percentage")
+    manual.add_argument("channel", type=int)
+    manual.add_argument("percent", type=float)
+
+    curve = sub.add_parser("curve", help="set a channel curve, e.g. 40,20;60,50;80,100")
+    curve.add_argument("channel", type=int)
+    curve.add_argument("points")
+
+    source = sub.add_parser("curve-source", help="temperature sensor for curves")
+    source.add_argument("source",
+                        choices=("cpu", "tctl", "system", "vrm", "chipset", "socket"))
+
+    args = parser.parse_args(raw_argv)
+    globals()["SOCKET_PATH"] = args.socket
+    command = args.command or "status"
+
+    if command == "status":
+        try:
+            result = request({"cmd": "status"}, timeout=2.0)
+        except (OSError, ValueError, RuntimeError):
+            result = local_status()
+        print(json.dumps(result, indent=2 if pretty else None))
+        return 0 if result.get("ok", True) else 1
+
+    if command == "mode":
+        payload = {"cmd": "mode", "mode": args.mode}
+    elif command == "profile":
+        payload = {"cmd": "profile", "profile": args.profile}
+    elif command == "manual":
+        payload = {"cmd": "manual", "channel": args.channel,
+                   "percent": args.percent}
+    elif command == "curve":
+        payload = {"cmd": "curve", "channel": args.channel,
+                   "points": parse_points(args.points)}
+    elif command == "curve-source":
+        payload = {"cmd": "curve_source", "source": args.source}
+    else:
+        payload = {"cmd": command}
+
+    try:
+        result = request(payload)
+    except (OSError, ValueError, RuntimeError) as error:
+        print(json.dumps({
+            "ok": False,
+            "error": f"cannot reach msi-fan-rgbd at {SOCKET_PATH}: {error}",
+        }), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2 if pretty else None))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
