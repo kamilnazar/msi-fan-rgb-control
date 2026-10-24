@@ -141,6 +141,25 @@ Functions: `open`, `close`, `toggle`, `refresh`, `status`, `profile <id>`,
 `rgbBrightness <percent>`. With several monitors, the handler answers on one
 bar instance; clicking the widget always opens the popup on the bar you clicked.
 
+### Using with CoolerControl
+
+[CoolerControl](https://docs.coolercontrol.org/) can run alongside the plugin,
+but only one program may own the fan PWM registers at a time. Both detect the
+same `nct6687` fans and temperatures.
+
+- Leave CoolerControl's fan functions **unassigned** (its default "Unmanaged"
+  profile) and use the widget's profiles and manual sliders. The daemon owns
+  PWM and CoolerControl just shows dashboards.
+- To give fan control to CoolerControl instead: select **Auto** in the widget,
+  then `sudo systemctl disable --now msi-fan-rgbd`, and assign fan functions in
+  CoolerControl. The widget still shows temperatures and RPM read-only, and RGB
+  keeps working.
+- To take control back: `sudo systemctl enable --now msi-fan-rgbd`, then pick a
+  profile in the widget.
+- Never run a CoolerControl fan function while the widget is in Silent,
+  Balanced, Performance or Manual: both daemons would write `pwmN` and the fans
+  would oscillate.
+
 ### Custom curves
 
 Edit `/etc/msi-fan-rgb/config.json`, then `sudo systemctl restart msi-fan-rgbd`
@@ -202,6 +221,10 @@ the active session; re-plugging the controller or a reboot fixes stale ACLs.
 `options nct6687 msi_fan_brute_force=1` in `/etc/modprobe.d/`, and a full
 reboot. That option is for the `msi_alt1` register layout; do not force it on
 this B650 board.
+
+**Fans oscillate between two speeds** — two controllers are writing PWM, for
+example CoolerControl functions plus `msi-fan-rgbd`. Keep only one active; see
+[Using with CoolerControl](#using-with-coolercontrol).
 
 **After suspend** — the daemon retries failed writes on the next tick and the
 systemd unit restarts it if needed. If the board resets fan control on resume,
